@@ -10,10 +10,10 @@ That line is the whole setup. From then on the mod checks your usage before ever
 
 It is for the run you start and walk away from. A long job, or a loop that has gone wrong, can spend the rest of your week's allowance before you look at the screen again. With a budget set, the most it can spend is the amount you chose.
 
-The mod also adds a row above your prompt, so you can see usage against the budget and which subagents are out:
+The mod also adds a row above your prompt, in the terminal, the desktop app and the mobile apps, so you can see where usage stands against the budget:
 
 ```
-workers: 2 out, longest 6m (Build the parser, Review the parser) | usage 41% | budget % [ 55 ]
+workers: 2 out, longest 6m (Build the parser, Review the parser) | usage 41% | budget % [ 55 ] | Fable 5.2
 ```
 
 ## Install
@@ -46,6 +46,8 @@ The number is a whole percent of your weekly allowance, from 1 to 100. You can a
 
 - `/cap` on its own shows the budget and your current usage.
 - `/cap off` removes the budget.
+
+In the desktop and mobile apps the box is the surest way to set it. If `/cap 55` there answers that only the person at the keyboard sets the budget, type the number into the box.
 
 The budget is kept in `~/.claude/usage_cap`. It outlasts the session, and every Claude Code session on the machine that has the mod installed is held to the same number.
 
@@ -105,8 +107,9 @@ Claude cannot raise its own budget through its tools either. A file edit aimed a
 - `workers` shows how many subagents are out right now, how long the longest has been out, and what the first two are doing.
 - `usage` is your weekly usage as a percent.
 - `budget %` is the box that holds the budget.
+- The last segment is the model the session is running.
 
-The row refreshes every 5 seconds. The budget check does not wait for the refresh.
+The row is drawn in the terminal, the desktop app and the mobile apps. It refreshes every 5 seconds. The budget check does not wait for the refresh.
 
 ## Optional: show a running job in the row
 

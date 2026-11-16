@@ -17,6 +17,8 @@ export type Snapshot = {
   job: string | null
   used: number | null
   cap: string
+  // Absent in a snapshot an earlier version of the mod stored.
+  model?: string | null
   at: number
 }
 

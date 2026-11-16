@@ -38,6 +38,7 @@ const engine = (
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('command.run', () => ({}))
   on('agent.list', () => ({ value: [] }))
+  on('session.model', () => ({ value: 'Fable 5.2' }))
   on('session.usage', () => ({
     value: {
       startedAt: 0,
@@ -344,50 +345,55 @@ const BAND = {
   },
 } as const
 
-test('the row shows workers, usage and the budget box, and the box sets the budget', async ($, on) => {
-  const world = engine(on, { [CAP]: '25\n' })
-  const toasts: string[] = []
+// The row draws from each surface's own elements: the terminal, the desktop
+// app and the mobile apps all raise the band.
+for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+  test(`${surface}: the row shows workers, usage and the budget box, and the box sets the budget`, async ($, on) => {
+    const world = engine(on, { [CAP]: '25\n' })
+    const toasts: string[] = []
 
-  on('ui.toast', (_, e) => {
-    toasts.push(e.text)
+    on('ui.toast', (_, e) => {
+      toasts.push(e.text)
 
-    return { value: undefined }
+      return { value: undefined }
+    })
+
+    await $.session.start({ ...START, surface })
+    const ui = await $.ui.mount({ ...BAND, surface })
+
+    expect((await ui.find({ type: 'Text', text: /workers/ }))?.text).toBe('workers: none out')
+    expect((await ui.find({ type: 'Text', text: /usage/ }))?.text).toContain('usage 17%')
+    expect((await ui.find({ type: 'Input', key: 'cap' }))?.props.value).toBe('25')
+    expect((await ui.find({ type: 'Text', text: /Fable/ }))?.text).toBe('| Fable 5.2')
+
+    await ui.input({ key: 'cap', text: '40' })
+    expect(world.files[CAP]).toBe('40\n')
+    expect(toasts).toEqual(['Usage budget set to 40%.'])
+
+    await ui.input({ key: 'cap', text: 'lots' })
+    expect(world.files[CAP]).toBe('40\n')
+    await ui.unmount()
   })
 
-  await $.session.start(START)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  test(`${surface}: the row says so when the budget is reached`, async ($, on) => {
+    engine(on, { [CAP]: '25\n' }, 31.4)
 
-  expect((await ui.find({ type: 'Text', text: /workers/ }))?.text).toBe('workers: none out')
-  expect((await ui.find({ type: 'Text', text: /usage/ }))?.text).toContain('usage 17%')
-  expect((await ui.find({ type: 'Input', key: 'cap' }))?.props.value).toBe('25')
+    await $.session.start({ ...START, surface })
+    const ui = await $.ui.mount({ ...BAND, surface })
 
-  await ui.input({ key: 'cap', text: '40' })
-  expect(world.files[CAP]).toBe('40\n')
-  expect(toasts).toEqual(['Usage budget set to 40%.'])
+    expect((await ui.find({ type: 'Text', text: /usage/ }))?.text).toContain(
+      'usage 31% BUDGET REACHED, tools refused',
+    )
+    await ui.unmount()
+  })
 
-  await ui.input({ key: 'cap', text: 'lots' })
-  expect(world.files[CAP]).toBe('40\n')
-  await ui.unmount()
-})
+  test(`${surface}: the row shows a question mark while there is no usage reading`, async ($, on) => {
+    engine(on, { [CAP]: '25\n' }, null)
 
-test('the row says so when the budget is reached', async ($, on) => {
-  engine(on, { [CAP]: '25\n' }, 31.4)
+    await $.session.start({ ...START, surface })
+    const ui = await $.ui.mount({ ...BAND, surface })
 
-  await $.session.start(START)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-
-  expect((await ui.find({ type: 'Text', text: /usage/ }))?.text).toContain(
-    'usage 31% BUDGET REACHED, tools refused',
-  )
-  await ui.unmount()
-})
-
-test('the row shows a question mark while there is no usage reading', async ($, on) => {
-  engine(on, { [CAP]: '25\n' }, null)
-
-  await $.session.start(START)
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-
-  expect((await ui.find({ type: 'Text', text: /usage/ }))?.text).toContain('usage ?')
-  await ui.unmount()
-})
+    expect((await ui.find({ type: 'Text', text: /usage/ }))?.text).toContain('usage ?')
+    await ui.unmount()
+  })
+}

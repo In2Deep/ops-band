@@ -8,7 +8,8 @@ import type { Reading, Snapshot, Worker } from '../types'
 // reaches it, every tool call is refused and Claude is told to say where it
 // stopped and end its turn; no tool runs again until the person raises the
 // budget or turns it off. The band above the prompt shows the agents out
-// working, usage against the budget, and the box that sets it.
+// working, usage against the budget, the box that sets it, and the model. It
+// draws wherever the band is raised: the terminal, the desktop app, mobile.
 
 const snapshot = atom({ plugin: 'ops-band', key: 'snapshot' } as const, null)
 
@@ -164,6 +165,15 @@ const readUsed = async ($: EngineInterface): Promise<number | null> => {
   return live?.percent ?? null
 }
 
+// The main loop's model as /model shows it, or null when it cannot be read.
+const readModel = async ($: EngineInterface): Promise<string | null> => {
+  try {
+    return (await $.session.model()) || null
+  } catch {
+    return null
+  }
+}
+
 const isOver = (used: number | null, cap: string): boolean => {
   const percent = capPercent(cap)
 
@@ -208,6 +218,7 @@ const refresh = async ($: EngineInterface): Promise<void> => {
     job: await readJob($, now),
     used: await readUsed($),
     cap: await readCap($),
+    model: await readModel($),
     at: now,
   }
 
@@ -405,6 +416,7 @@ export const register: Register = on => {
             void submitCap($, value)
           }}
         />
+        {now.model ? <Text dimColor>| {now.model}</Text> : null}
       </Box>
     )
   })
