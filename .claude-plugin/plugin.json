@@ -1,0 +1,10 @@
+{
+  "name": "ops-band",
+  "version": "0.1.0",
+  "description": "A row above the prompt: agents out working, an optional job status, weekly usage, and a box to type a usage cap into (also /cap).",
+  "types": "./types/index.d.ts",
+  "license": "MIT-0",
+  "author": {
+    "name": "Brandon Hatch"
+  }
+}

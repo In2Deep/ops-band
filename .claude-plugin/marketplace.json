@@ -1,0 +1,5 @@
+{
+  "name": "ops-band",
+  "owner": { "name": "In2Deep" },
+  "plugins": [{ "name": "ops-band", "source": "./" }]
+}
