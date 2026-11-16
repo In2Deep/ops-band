@@ -71,13 +71,17 @@ When you come back, read Claude's last message, raise the budget, and tell it to
 
 ## Try it
 
-You can watch the stop happen in under a minute. Look at the usage figure in the row, set a budget at or below it, and ask Claude to do anything that needs a tool:
+You can watch the stop happen without waiting for a long run. Look at the usage figure in the row and set the budget to that same percent. If the row says `usage 41%`:
 
 ```
-/cap 1
+/cap 41
 ```
 
-Claude's next tool call comes back refused and it stops. Put your real budget back with `/cap 55`, or remove it with `/cap off`. Other sessions on the machine that have the mod are stopped too while the low budget is set, so pick a moment when nothing else is running.
+Then ask Claude to do anything that needs a tool. Usage is already at the budget, so the next tool call comes back refused and Claude stops.
+
+To watch it trip on its own, set the budget one point above your usage instead (`/cap 42` here) and keep working. The stop comes when your usage climbs that one point, which can take a while.
+
+Afterwards put your real budget back with `/cap 55`, or remove it with `/cap off`. Other sessions on the machine that have the mod are stopped too while the low budget is set, so pick a moment when nothing else is running.
 
 ## How the stop is enforced
 
