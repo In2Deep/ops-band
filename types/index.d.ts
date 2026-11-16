@@ -5,6 +5,13 @@ export type Worker = {
   since: number
 }
 
+// A usage reading kept between sessions: the percent used, and when its window
+// resets (epoch milliseconds).
+export type Reading = {
+  percent: number
+  resetsAt: number
+}
+
 export type Snapshot = {
   workers: Worker[]
   job: string | null

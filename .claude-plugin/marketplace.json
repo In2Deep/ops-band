@@ -1,5 +1,13 @@
 {
   "name": "ops-band",
-  "owner": { "name": "In2Deep" },
-  "plugins": [{ "name": "ops-band", "source": "./" }]
+  "owner": {
+    "name": "In2Deep"
+  },
+  "plugins": [
+    {
+      "name": "ops-band",
+      "source": "./"
+    }
+  ],
+  "description": "ops-band: a usage budget for long, unattended Claude Code runs."
 }

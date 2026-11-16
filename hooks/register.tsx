@@ -1,17 +1,22 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, ToolCallInput } from 'claude-code'
 
-import type { Snapshot, Worker } from '../types'
+import type { Reading, Snapshot, Worker } from '../types'
 
-// One row above the prompt: which agents are out working, an optional one-line
-// job status, weekly usage, and a box for the usage cap. The cap file is written
-// only from what the person at the keyboard types (the box, or /cap).
+// A usage budget for unattended runs. The person sets a percent of the weekly
+// allowance (the box in the band, or /cap) and walks away. Once weekly usage
+// reaches it, every tool call is refused and Claude is told to say where it
+// stopped and end its turn; no tool runs again until the person raises the
+// budget or turns it off. The band above the prompt shows the agents out
+// working, usage against the budget, and the box that sets it.
 
 const snapshot = atom({ plugin: 'ops-band', key: 'snapshot' } as const, null)
 
 const LIVE = new Set(['pending', 'running', 'waiting'])
 const REFRESH_MS = 5000
 const JOB_STALE_MS = 45 * 60 * 1000
+const CAP_FILE = 'usage_cap'
+const READING = 'reading'
 
 const minutes = (ms: number): string => {
   const whole = Math.max(0, Math.round(ms / 60000))
@@ -40,11 +45,34 @@ const readClaude = async ($: EngineInterface, name: string): Promise<string | nu
   return path === null ? null : readText($, path)
 }
 
-// The cap as the file holds it: a whole percent, "off", or "" when there is none.
+// The budget as the file holds it: a percent, "off", or "" when there is none.
 const readCap = async ($: EngineInterface): Promise<string> => {
-  const text = await readClaude($, 'usage_cap')
+  const text = await readClaude($, CAP_FILE)
 
-  return text === null ? '' : text.trim()
+  return text === null ? '' : text.trim().replace(/%$/, '')
+}
+
+// The budget as a number, or null when there is none to enforce. /cap and the
+// box write whole percents; a file edited by hand may hold a decimal.
+const capPercent = (cap: string): number | null => {
+  const value = Number(cap)
+
+  return /^\d{1,3}(\.\d+)?$/.test(cap) && value >= 1 && value <= 100 ? value : null
+}
+
+// The budget in words, for /cap.
+const describeCap = (cap: string): string => {
+  if (cap === '') {
+    return 'none'
+  }
+
+  if (cap === 'off') {
+    return 'off'
+  }
+
+  return capPercent(cap) === null
+    ? `not valid ("${cap}"), so nothing is enforced; set it with /cap`
+    : `${cap}%`
 }
 
 // Optional: "<name> <stage> <epoch seconds>" in ~/.claude/ops-band/job.status,
@@ -66,45 +94,80 @@ const readJob = async ($: EngineInterface, now: number): Promise<string | null> 
   return `${name}: ${stage}, ${minutes(now - since)}`
 }
 
-// Weekly usage: the highest used_percentage of any window but five_hour, from
-// ~/.claude/usage_rate_limits.json when a status line script writes one (see the
-// README), so the band and an enforcing hook read the same figure. Without that
-// file, this session's own figure.
-const readUsed = async ($: EngineInterface): Promise<number | null> => {
-  const text = await readClaude($, 'usage_rate_limits.json')
-
-  if (text !== null) {
-    try {
-      const limits: unknown = (JSON.parse(text) as { rate_limits?: unknown }).rate_limits
-      const figures = Object.entries(
-        limits !== null && typeof limits === 'object' ? limits : {},
-      )
-        .filter(([window]) => window !== 'five_hour')
-        .map(([, value]) =>
-          value !== null && typeof value === 'object'
-            ? (value as { used_percentage?: unknown }).used_percentage
-            : null,
-        )
-        .filter((figure): figure is number => typeof figure === 'number')
-
-      if (figures.length > 0) {
-        return Math.round(Math.max(...figures))
-      }
-    } catch {
-      // Not JSON: fall through to the session's own figure.
-    }
-  }
-
+// What this session's last response reported: the fullest window of the
+// account, the five-hour window left out (it resets on its own within the day),
+// and when that window resets. Null before the session's first reading, or off
+// a subscription.
+const readLive = async (
+  $: EngineInterface,
+): Promise<{ percent: number; resetsAt: number | null } | null> => {
   try {
     const usage = await $.session.usage()
-    const figures = usage.rateLimits
-      .filter(limit => limit.kind !== 'five_hour')
-      .map(limit => limit.percentUsed)
+    const windows = usage.rateLimits.filter(limit => limit.kind !== 'five_hour')
 
-    return figures.length > 0 ? Math.round(Math.max(...figures)) : null
+    if (windows.length === 0) {
+      return null
+    }
+
+    const fullest = windows.reduce((most, limit) =>
+      limit.percentUsed > most.percentUsed ? limit : most,
+    )
+    const resetsAt = Date.parse(fullest.resetsAt ?? '')
+
+    return { percent: fullest.percentUsed, resetsAt: Number.isFinite(resetsAt) ? resetsAt : null }
   } catch {
     return null
   }
+}
+
+// The last reading any session on this machine took, kept in the mod's store
+// until its window resets. Usage only grows within a window, so the real figure
+// is at least this.
+const recall = async ($: EngineInterface, now: number): Promise<Reading | null> => {
+  const kept = await $.store.get(READING)
+
+  if (kept === null || typeof kept !== 'object') {
+    return null
+  }
+
+  const { percent, resetsAt } = kept as Partial<Reading>
+
+  return typeof percent === 'number' && typeof resetsAt === 'number' && now < resetsAt
+    ? { percent, resetsAt }
+    : null
+}
+
+// Usage the budget is held against. A session has no reading of its own until
+// its first response is in, and its first tool calls come before that: until
+// then it is held to the last reading another session kept. Null when there is
+// neither.
+const readUsed = async ($: EngineInterface): Promise<number | null> => {
+  const live = await readLive($)
+
+  try {
+    const kept = await recall($, await $.clock.now())
+
+    if (live === null) {
+      return kept?.percent ?? null
+    }
+
+    if (
+      live.resetsAt !== null &&
+      (kept?.percent !== live.percent || kept.resetsAt !== live.resetsAt)
+    ) {
+      await $.store.set(READING, { percent: live.percent, resetsAt: live.resetsAt })
+    }
+  } catch {
+    // The store could not be read or written: the session's own reading stands.
+  }
+
+  return live?.percent ?? null
+}
+
+const isOver = (used: number | null, cap: string): boolean => {
+  const percent = capPercent(cap)
+
+  return used !== null && percent !== null && used >= percent
 }
 
 // First time each live agent was seen, for "how long has it been out".
@@ -161,12 +224,12 @@ const refreshQuietly = async ($: EngineInterface): Promise<void> => {
   }
 }
 
-// What the cap box does with what was typed into it.
+// What the budget box does with what was typed into it.
 const submitCap = async ($: EngineInterface, typed: string): Promise<void> => {
   try {
     $.ui.toast(await setCap($, typed))
   } catch {
-    $.ui.toast('The cap file could not be written.')
+    $.ui.toast('The budget file could not be written.')
   }
 }
 
@@ -178,10 +241,10 @@ const setCap = async ($: EngineInterface, typed: string): Promise<string> => {
     return `Not set: "${typed.trim()}" is not a percent from 1 to 100, or "off".`
   }
 
-  const path = await inClaude($, 'usage_cap')
+  const path = await inClaude($, CAP_FILE)
 
   if (path === null) {
-    return 'Not set: HOME is not set, so there is no cap file to write.'
+    return 'Not set: HOME is not set, so there is no budget file to write.'
   }
 
   const cap = value === 'off' ? value : String(Number(value))
@@ -190,14 +253,56 @@ const setCap = async ($: EngineInterface, typed: string): Promise<string> => {
   // The write is done: a refresh that fails must not report it as failed.
   await refreshQuietly($)
 
-  return cap === 'off' ? 'Usage cap is off.' : `Usage cap set to ${cap}%.`
+  if (cap === 'off') {
+    return 'Usage budget is off.'
+  }
+
+  const used = await readUsed($)
+
+  return isOver(used, cap)
+    ? `Usage budget set to ${cap}%. Usage is already at ${Math.floor(used ?? 0)}%, so tool calls stay refused.`
+    : `Usage budget set to ${cap}%.`
+}
+
+// The file a file-writing tool names as its target.
+const targetOf = (e: ToolCallInput): string | null => {
+  if (e.tool === 'Write' || e.tool === 'Edit') {
+    return e.file_path
+  }
+
+  return e.tool === 'NotebookEdit' ? e.notebook_path : null
+}
+
+// The shell command a tool would run.
+const commandOf = (e: ToolCallInput): string | null => {
+  if (e.tool === 'Bash') {
+    return e.command
+  }
+
+  return e.tool === 'Monitor' ? (e.command ?? null) : null
+}
+
+// Whether a tool call is aimed at the budget file: a file tool whose path ends
+// at .claude/usage_cap however it is spelled (capitals, "..", doubled slashes),
+// or a shell command that names it.
+const isAimedAtCap = (e: ToolCallInput): boolean => {
+  const parts = (targetOf(e) ?? '')
+    .toLowerCase()
+    .split(/[\\/]+/)
+    .filter(part => part !== '' && part !== '.')
+
+  if (parts[parts.length - 1] === CAP_FILE && parts.includes('.claude')) {
+    return true
+  }
+
+  return (commandOf(e) ?? '').toLowerCase().includes(`.claude/${CAP_FILE}`)
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'cap',
-      description: 'Show the weekly usage cap, or set it: /cap 95, /cap off',
+      description: 'Show the usage budget, or set it: /cap 55, /cap off',
       argumentHint: '[percent | off]',
     })
     await refreshQuietly($)
@@ -214,20 +319,48 @@ export const register: Register = on => {
     if (typed === '') {
       const cap = await readCap($)
       const used = await readUsed($)
+      const usage = used === null ? 'unknown' : `${Math.floor(used)}%`
+      const state = isOver(used, cap) ? ' Budget reached: tool calls are refused.' : ''
 
-      return {
-        text: `Usage cap: ${cap === '' ? 'none' : cap === 'off' ? 'off' : `${cap}%`}. Weekly usage: ${used === null ? 'unknown' : `${used}%`}.`,
-      }
+      return { text: `Usage budget: ${describeCap(cap)}. Weekly usage: ${usage}.${state}` }
     }
 
-    // Only the person's own Enter moves the cap: at the terminal, or from their
-    // phone through Remote Control. Never a notification, a peer or a plugin.
+    // Only the person's own Enter moves the budget: at the terminal, or from
+    // their phone through Remote Control. Never a notification, a peer or a plugin.
     if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') {
-      return { text: 'Only the person at the keyboard sets the cap: type /cap yourself.' }
+      return { text: 'Only the person at the keyboard sets the budget: type /cap yourself.' }
     }
 
     return { text: await setCap($, typed) }
   })
+
+  // The babysitter. Every tool call of the session and its subagents passes here.
+  on('tool.call', async ($, e, next) => {
+    // The budget is the person's to move: a tool call aimed at the budget file
+    // is refused whatever the usage is.
+    if (isAimedAtCap(e)) {
+      return { deny: 'ops-band: the usage budget file is set by the person with /cap, not by a tool.' }
+    }
+
+    const cap = await readCap($)
+    const used = await readUsed($)
+
+    if (!isOver(used, cap)) {
+      return next(e)
+    }
+
+    return {
+      deny:
+        `USAGE BUDGET REACHED: weekly usage is at ${Math.floor(used ?? 0)}% and the budget is ${cap}%. ` +
+        'Stop all work now. Do not retry this or any other tool: every tool call is refused until the person raises the budget. ' +
+        'In your reply, say where you stopped and what is left to do, then end your turn. ' +
+        'Only the person can lift the budget, by typing /cap.',
+    }
+  }).catch(($, e, next) =>
+    // A check that breaks must not hold an unattended run hostage: the call goes
+    // through (or, where it already ran, its own result stands).
+    next(e),
+  )
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const now = await read($, snapshot)
@@ -250,6 +383,7 @@ export const register: Register = on => {
       now.workers.length === 0
         ? 'workers: none out'
         : `workers: ${now.workers.length} out, longest ${minutes(now.at - longest)} (${names}${more})`
+    const hasReachedBudget = isOver(now.used, now.cap)
 
     return (
       <Box flexDirection="row" gap={1}>
@@ -257,15 +391,16 @@ export const register: Register = on => {
           {workers}
         </Text>
         {now.job !== null && <Text bold>| {now.job}</Text>}
-        <Text dimColor>
-          | usage {now.used === null ? '?' : `${now.used}%`}
+        <Text bold={hasReachedBudget} dimColor={!hasReachedBudget}>
+          | usage {now.used === null ? '?' : `${Math.floor(now.used)}%`}
+          {hasReachedBudget ? ' BUDGET REACHED, tools refused' : ''}
         </Text>
         <Input
           key="cap"
-          label="| cap %"
+          label="| budget %"
           placeholder="none"
           value={now.cap}
-          submitLabel="set cap"
+          submitLabel="set budget"
           onSubmit={value => {
             void submitCap($, value)
           }}

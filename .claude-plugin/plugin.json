@@ -1,7 +1,7 @@
 {
   "name": "ops-band",
-  "version": "0.1.0",
-  "description": "A row above the prompt: agents out working, an optional job status, weekly usage, and a box to type a usage cap into (also /cap).",
+  "version": "0.2.0",
+  "description": "A usage budget for unattended runs: set a percent of your weekly allowance with /cap, and at that point every tool call is refused until you raise it. Shows agents out, usage and the budget in a row above the prompt.",
   "types": "./types/index.d.ts",
   "license": "MIT-0",
   "author": {
