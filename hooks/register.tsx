@@ -10,14 +10,21 @@ import type { Reading, Snapshot, Worker } from '../types'
 // budget or turns it off. The band above the prompt shows the agents out
 // working, usage against the budget, the box that sets it, and the model. It
 // draws wherever the band is raised: the terminal, the desktop app, mobile.
+//
+// A budget belongs to the account that set it: two accounts on one machine (a
+// personal login in the terminal, a work login in the desktop app) each have
+// their own number and their own usage.
 
 const snapshot = atom({ plugin: 'ops-band', key: 'snapshot' } as const, null)
 
 const LIVE = new Set(['pending', 'running', 'waiting'])
 const REFRESH_MS = 5000
 const JOB_STALE_MS = 45 * 60 * 1000
+const ACCOUNT_MS = 60 * 1000
 const CAP_FILE = 'usage_cap'
+const CAP_DIR = 'usage_cap.d'
 const READING = 'reading'
+const ID = /^[0-9a-f-]{8,64}$/i
 
 const minutes = (ms: number): string => {
   const whole = Math.max(0, Math.round(ms / 60000))
@@ -46,12 +53,82 @@ const readClaude = async ($: EngineInterface, name: string): Promise<string | nu
   return path === null ? null : readText($, path)
 }
 
-// The budget as the file holds it: a percent, "off", or "" when there is none.
-const readCap = async ($: EngineInterface): Promise<string> => {
-  const text = await readClaude($, CAP_FILE)
+// The account the session is signed in to, as a name fit for a file path, or
+// null when the mod cannot tell. A host that hands the session its login (the
+// desktop app) names the account in the environment; a terminal session's is
+// in the login Claude Code keeps in its own config file.
+const readAccount = async ($: EngineInterface): Promise<string | null> => {
+  try {
+    let organization = await $.env.get('CLAUDE_CODE_ORGANIZATION_UUID')
+    let person = await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')
 
-  return text === null ? '' : text.trim().replace(/%$/, '')
+    if (!organization && !person) {
+      const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || (await $.env.get('HOME'))
+      const text = dir ? await readText($, `${dir}/.claude.json`) : null
+      const login =
+        text === null
+          ? undefined
+          : (JSON.parse(text) as { oauthAccount?: Record<string, unknown> }).oauthAccount
+
+      organization = String(login?.organizationUuid ?? '')
+      person = String(login?.accountUuid ?? '')
+    }
+
+    const ids = [organization, person].filter(
+      (id): id is string => typeof id === 'string' && ID.test(id),
+    )
+
+    return ids.length > 0 ? ids.join('_').toLowerCase() : null
+  } catch {
+    return null
+  }
 }
+
+// The session's account: read at the session's start and once a minute after
+// (a /login changes it), so no tool call waits on the config file.
+let account: string | null | undefined
+
+const who = async ($: EngineInterface): Promise<string | null> => {
+  if (account === undefined) {
+    account = await readAccount($)
+  }
+
+  return account
+}
+
+// Where the session's budget is written: the account's own file, or the
+// machine-wide one when the account cannot be told.
+const capName = async ($: EngineInterface): Promise<string> => {
+  const id = await who($)
+
+  return id === null ? CAP_FILE : `${CAP_DIR}/${id}`
+}
+
+// Where the session's last usage reading is kept in the mod's store.
+const readingKey = async ($: EngineInterface): Promise<string> => {
+  const id = await who($)
+
+  return id === null ? READING : `${READING}:${id}`
+}
+
+// The budget the session is held to, as its file holds it: a percent, "off",
+// or "" when there is none. An account that has set none of its own is held to
+// the machine-wide file, where versions before 0.3 kept the one budget.
+const readBudget = async ($: EngineInterface): Promise<{ cap: string; isOwn: boolean }> => {
+  const tidy = (text: string): string => text.trim().replace(/%$/, '')
+  const id = await who($)
+  const own = id === null ? null : await readClaude($, `${CAP_DIR}/${id}`)
+
+  if (own !== null) {
+    return { cap: tidy(own), isOwn: true }
+  }
+
+  const shared = await readClaude($, CAP_FILE)
+
+  return { cap: shared === null ? '' : tidy(shared), isOwn: id === null }
+}
+
+const readCap = async ($: EngineInterface): Promise<string> => (await readBudget($)).cap
 
 // The budget as a number, or null when there is none to enforce. /cap and the
 // box write whole percents; a file edited by hand may hold a decimal.
@@ -121,11 +198,11 @@ const readLive = async (
   }
 }
 
-// The last reading any session on this machine took, kept in the mod's store
-// until its window resets. Usage only grows within a window, so the real figure
-// is at least this.
+// The last reading any session of this account took on this machine, kept in
+// the mod's store until its window resets. Usage only grows within a window,
+// so the real figure is at least this.
 const recall = async ($: EngineInterface, now: number): Promise<Reading | null> => {
-  const kept = await $.store.get(READING)
+  const kept = await $.store.get(await readingKey($))
 
   if (kept === null || typeof kept !== 'object') {
     return null
@@ -140,8 +217,8 @@ const recall = async ($: EngineInterface, now: number): Promise<Reading | null> 
 
 // Usage the budget is held against. A session has no reading of its own until
 // its first response is in, and its first tool calls come before that: until
-// then it is held to the last reading another session kept. Null when there is
-// neither.
+// then it is held to the last reading another session of the account kept.
+// Null when there is neither.
 const readUsed = async ($: EngineInterface): Promise<number | null> => {
   const live = await readLive($)
 
@@ -156,7 +233,10 @@ const readUsed = async ($: EngineInterface): Promise<number | null> => {
       live.resetsAt !== null &&
       (kept?.percent !== live.percent || kept.resetsAt !== live.resetsAt)
     ) {
-      await $.store.set(READING, { percent: live.percent, resetsAt: live.resetsAt })
+      await $.store.set(await readingKey($), {
+        percent: live.percent,
+        resetsAt: live.resetsAt,
+      })
     }
   } catch {
     // The store could not be read or written: the session's own reading stands.
@@ -252,7 +332,7 @@ const setCap = async ($: EngineInterface, typed: string): Promise<string> => {
     return `Not set: "${typed.trim()}" is not a percent from 1 to 100, or "off".`
   }
 
-  const path = await inClaude($, CAP_FILE)
+  const path = await inClaude($, await capName($))
 
   if (path === null) {
     return 'Not set: HOME is not set, so there is no budget file to write.'
@@ -264,15 +344,18 @@ const setCap = async ($: EngineInterface, typed: string): Promise<string> => {
   // The write is done: a refresh that fails must not report it as failed.
   await refreshQuietly($)
 
+  // Said only where the budget is one account's and not the machine's.
+  const whose = (await who($)) === null ? '' : ' for this account'
+
   if (cap === 'off') {
-    return 'Usage budget is off.'
+    return `Usage budget is off${whose}.`
   }
 
   const used = await readUsed($)
 
   return isOver(used, cap)
-    ? `Usage budget set to ${cap}%. Usage is already at ${Math.floor(used ?? 0)}%, so tool calls stay refused.`
-    : `Usage budget set to ${cap}%.`
+    ? `Usage budget set to ${cap}%${whose}. Usage is already at ${Math.floor(used ?? 0)}%, so tool calls stay refused.`
+    : `Usage budget set to ${cap}%${whose}.`
 }
 
 // The file a file-writing tool names as its target.
@@ -293,16 +376,20 @@ const commandOf = (e: ToolCallInput): string | null => {
   return e.tool === 'Monitor' ? (e.command ?? null) : null
 }
 
-// Whether a tool call is aimed at the budget file: a file tool whose path ends
-// at .claude/usage_cap however it is spelled (capitals, "..", doubled slashes),
-// or a shell command that names it.
+// Whether a tool call is aimed at a budget file: a file tool whose path ends at
+// .claude/usage_cap or passes through .claude/usage_cap.d, however it is
+// spelled (capitals, "..", doubled slashes), or a shell command that names
+// either (the one name begins the other).
 const isAimedAtCap = (e: ToolCallInput): boolean => {
   const parts = (targetOf(e) ?? '')
     .toLowerCase()
     .split(/[\\/]+/)
     .filter(part => part !== '' && part !== '.')
 
-  if (parts[parts.length - 1] === CAP_FILE && parts.includes('.claude')) {
+  if (
+    parts.includes('.claude') &&
+    (parts[parts.length - 1] === CAP_FILE || parts.includes(CAP_DIR))
+  ) {
     return true
   }
 
@@ -316,9 +403,15 @@ export const register: Register = on => {
       description: 'Show the usage budget, or set it: /cap 55, /cap off',
       argumentHint: '[percent | off]',
     })
+    account = await readAccount($)
     await refreshQuietly($)
     $.clock.every(REFRESH_MS, () => {
       void refreshQuietly($)
+    })
+    $.clock.every(ACCOUNT_MS, () => {
+      void readAccount($).then(id => {
+        account = id
+      })
     })
 
     return next(e)
@@ -328,12 +421,18 @@ export const register: Register = on => {
     const typed = e.args.trim()
 
     if (typed === '') {
-      const cap = await readCap($)
+      const { cap, isOwn } = await readBudget($)
       const used = await readUsed($)
       const usage = used === null ? 'unknown' : `${Math.floor(used)}%`
       const state = isOver(used, cap) ? ' Budget reached: tool calls are refused.' : ''
+      const source =
+        isOwn || cap === ''
+          ? ''
+          : ' This account has set no budget of its own, so the machine-wide one applies.'
 
-      return { text: `Usage budget: ${describeCap(cap)}. Weekly usage: ${usage}.${state}` }
+      return {
+        text: `Usage budget: ${describeCap(cap)}. Weekly usage: ${usage}.${state}${source}`,
+      }
     }
 
     // Only the person's own Enter moves the budget: at the terminal, or from

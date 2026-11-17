@@ -3,12 +3,28 @@ import type { On } from 'claude-code'
 
 const CAP = '/Users/owner/.claude/usage_cap'
 
+// Two logins on one machine: a work account the desktop app hands its sessions
+// in the environment, and a personal one in the terminal's own config file.
+const WORK = { organization: '11111111-aaaa-4aaa-8aaa-111111111111', person: '22222222-bbbb-4bbb-8bbb-222222222222' }
+const HOME_LOGIN = { organization: '33333333-cccc-4ccc-8ccc-333333333333', person: '44444444-dddd-4ddd-8ddd-444444444444' }
+const WORK_CAP = `/Users/owner/.claude/usage_cap.d/${WORK.organization}_${WORK.person}`
+const HOME_CAP = `/Users/owner/.claude/usage_cap.d/${HOME_LOGIN.organization}_${HOME_LOGIN.person}`
+const WORK_ENV = {
+  CLAUDE_CODE_ORGANIZATION_UUID: WORK.organization,
+  CLAUDE_CODE_ACCOUNT_UUID: WORK.person,
+}
+const CONFIG = '/Users/owner/.claude.json'
+const HOME_CONFIG = JSON.stringify({
+  oauthAccount: { organizationUuid: HOME_LOGIN.organization, accountUuid: HOME_LOGIN.person },
+})
+
 // The weekly window of every test resets a minute after the clock starts.
 const RESETS_AT = '1970-01-01T00:17:40.000Z'
 
 // The engine beneath the mod: a few files in memory, an empty store, no agents
 // out, and the usage windows the account reports (`world.weekly` is the weekly
-// figure, null for a session with no reading yet). `ran` lists the tool calls
+// figure, null for a session with no reading yet; `world.env` is the
+// environment, HOME alone unless a test adds to it). `ran` lists the tool calls
 // that got through.
 const engine = (
   on: On,
@@ -21,18 +37,19 @@ const engine = (
     writes: [] as string[],
     ran: [] as string[],
     weekly,
+    env: { HOME: '/Users/owner' } as Record<string, string>,
     clock: mock.clock(on, { now: 1_000_000 }),
   }
 
   mock.store(on)
 
-  if (hasBrokenEnv) {
-    on('env.get', () => {
+  on('env.get', (_, e) => {
+    if (hasBrokenEnv) {
       throw new Error('the environment cannot be read')
-    })
-  } else {
-    mock.env(on, { HOME: '/Users/owner' })
-  }
+    }
+
+    return { value: world.env[e.name] }
+  })
 
   on('command.register', () => ({ value: { command: 'cap' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -244,6 +261,91 @@ test('a session with a reading of its own goes by it, not by a kept one', async 
   expect(world.ran).toEqual(['Bash'])
 })
 
+test('a budget set in one account leaves the other account and the machine-wide file alone', async ($, on) => {
+  const world = engine(on, { [CAP]: '75\n', [CONFIG]: HOME_CONFIG })
+
+  // The desktop app's session, signed in to the work account.
+  world.env = { ...world.env, ...WORK_ENV }
+  await $.session.start(START)
+  expect((await $.command.run(run('57', 'composer'))).text).toBe('Usage budget set to 57% for this account.')
+  expect(world.files[WORK_CAP]).toBe('57\n')
+  expect(world.files[CAP]).toBe('75\n')
+  expect((await $.command.run(run('', 'composer'))).text).toBe('Usage budget: 57%. Weekly usage: 17%.')
+
+  // The terminal's session, signed in to the personal account.
+  world.env = { HOME: '/Users/owner' }
+  await $.session.start(START)
+  expect((await $.command.run(run('', 'composer'))).text).toBe(
+    'Usage budget: 75%. Weekly usage: 17%. This account has set no budget of its own, so the machine-wide one applies.',
+  )
+  expect((await $.command.run(run('90', 'composer'))).text).toBe('Usage budget set to 90% for this account.')
+  expect(world.files[HOME_CAP]).toBe('90\n')
+  expect(world.files[WORK_CAP]).toBe('57\n')
+  expect(world.files[CAP]).toBe('75\n')
+})
+
+test('each account is stopped at its own budget', async ($, on) => {
+  const world = engine(on, { [CAP]: '75\n', [CONFIG]: HOME_CONFIG, [WORK_CAP]: '57\n' }, 65)
+
+  // Work: 65% used against its own 57.
+  world.env = { ...world.env, ...WORK_ENV }
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith(
+    'USAGE BUDGET REACHED: weekly usage is at 65% and the budget is 57%.',
+  )
+
+  // Personal: 65% used against the machine-wide 75, which the work budget did not move.
+  world.env = { HOME: '/Users/owner' }
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+  expect(world.ran).toEqual(['Bash'])
+})
+
+test('an account that turns its budget off is not held to the machine-wide one', async ($, on) => {
+  const world = engine(on, { [CAP]: '25\n' }, 60)
+
+  world.env = { ...world.env, ...WORK_ENV }
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith('USAGE BUDGET REACHED')
+
+  expect((await $.command.run(run('off', 'composer'))).text).toBe('Usage budget is off for this account.')
+  expect(world.files[WORK_CAP]).toBe('off\n')
+  expect(world.files[CAP]).toBe('25\n')
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+})
+
+test('a usage reading kept for one account is not used for another', async ($, on) => {
+  const world = engine(on, { [CAP]: '25\n', [CONFIG]: HOME_CONFIG }, 60)
+
+  // The work account's session takes a reading of 60%, and it is kept.
+  world.env = { ...world.env, ...WORK_ENV }
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith('USAGE BUDGET REACHED')
+
+  // A new personal session with no reading yet is not held to the work figure.
+  world.env = { HOME: '/Users/owner' }
+  world.weekly = null
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+
+  // A new work session with no reading yet is.
+  world.env = { ...world.env, ...WORK_ENV }
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith(
+    'USAGE BUDGET REACHED: weekly usage is at 60% and the budget is 25%.',
+  )
+  expect(world.ran).toEqual(['Bash'])
+})
+
+test('an account id that is not one is not used as a file name', async ($, on) => {
+  const world = engine(on, { [CAP]: '25\n' })
+
+  world.env = { ...world.env, CLAUDE_CODE_ACCOUNT_UUID: '../../etc/passwd' }
+  await $.session.start(START)
+  expect((await $.command.run(run('40', 'composer'))).text).toBe('Usage budget set to 40%.')
+  expect(world.writes).toEqual([CAP])
+})
+
 test('a tool cannot move the budget file, whatever the usage', async ($, on) => {
   const world = engine(on, { [CAP]: '25\n' }, 1)
 
@@ -260,6 +362,10 @@ test('a tool cannot move the budget file, whatever the usage', async ($, on) => 
     await $.tool.call({ tool: 'Write', file_path: '/Users/owner/.Claude/USAGE_CAP', content: '100\n' }),
     await $.tool.call({ tool: 'Bash', command: 'echo 100 > ~/.claude/usage_cap' }),
     await $.tool.call({ tool: 'Bash', command: 'echo 100 > ~/.Claude/Usage_Cap' }),
+    // An account's own budget file.
+    await $.tool.call({ tool: 'Write', file_path: WORK_CAP, content: '100\n' }),
+    await $.tool.call({ tool: 'Edit', file_path: WORK_CAP, old_string: '57', new_string: '100' }),
+    await $.tool.call({ tool: 'Bash', command: `echo 100 > ${WORK_CAP}` }),
     await $.tool.call({
       tool: 'Monitor',
       description: 'watch',

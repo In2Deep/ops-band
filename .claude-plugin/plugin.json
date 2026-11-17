@@ -1,6 +1,6 @@
 {
   "name": "ops-band",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "A usage budget for unattended runs: set a percent of your weekly allowance with /cap, and at that point every tool call is refused until you raise it. Shows agents out, usage, the budget and the model in a row above the prompt, in the terminal and the desktop app.",
   "types": "./types/index.d.ts",
   "license": "MIT-0",
