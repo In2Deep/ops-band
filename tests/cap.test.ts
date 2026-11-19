@@ -1,29 +1,44 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 const CAP = '/Users/owner/.claude/usage_cap'
 
 // Two logins on one machine: a work account the desktop app hands its sessions
-// in the environment, and a personal one in the terminal's own config file.
+// in the environment, and a personal login in the terminal, which no file names
+// reliably: Claude Code's config file is shared, and names the work login,
+// because the desktop app's sessions keep writing theirs into it.
 const WORK = { organization: '11111111-aaaa-4aaa-8aaa-111111111111', person: '22222222-bbbb-4bbb-8bbb-222222222222' }
-const HOME_LOGIN = { organization: '33333333-cccc-4ccc-8ccc-333333333333', person: '44444444-dddd-4ddd-8ddd-444444444444' }
 const WORK_CAP = `/Users/owner/.claude/usage_cap.d/${WORK.organization}_${WORK.person}`
-const HOME_CAP = `/Users/owner/.claude/usage_cap.d/${HOME_LOGIN.organization}_${HOME_LOGIN.person}`
 const WORK_ENV = {
   CLAUDE_CODE_ORGANIZATION_UUID: WORK.organization,
   CLAUDE_CODE_ACCOUNT_UUID: WORK.person,
 }
 const CONFIG = '/Users/owner/.claude.json'
-const HOME_CONFIG = JSON.stringify({
-  oauthAccount: { organizationUuid: HOME_LOGIN.organization, accountUuid: HOME_LOGIN.person },
+const DESKTOP_CONFIG = JSON.stringify({
+  oauthAccount: { organizationUuid: WORK.organization, accountUuid: WORK.person },
 })
 
 // The weekly window of every test resets a minute after the clock starts.
 const RESETS_AT = '1970-01-01T00:17:40.000Z'
 
-// The engine beneath the mod: a few files in memory, an empty store, no agents
-// out, and the usage windows the account reports (`world.weekly` is the weekly
-// figure, null for a session with no reading yet; `world.env` is the
+// Where readings are kept in the mod's store: the machine-wide key, which a
+// terminal session uses, and the keys 0.3.0 kept them under.
+const KEPT = 'last-reading'
+const OLD_KEPT = 'reading'
+const OLD_WORK_KEPT = `reading:${WORK.organization}_${WORK.person}`
+
+// The usage windows the account reports: the five-hour window, which the budget
+// is never held against, and the weekly one, absent for a session with no
+// reading yet.
+const windows = (weekly: number | null) => [
+  { kind: 'five_hour', percentUsed: 80 },
+  ...(weekly === null ? [] : [{ kind: 'seven_day', percentUsed: weekly, resetsAt: RESETS_AT }]),
+]
+
+// The engine beneath the mod: a few files in memory, a store holding `kept`, no
+// agents out, and the usage windows the account reports (`world.weekly` is the
+// weekly figure, null for a session with no reading yet; `world.env` is the
 // environment, HOME alone unless a test adds to it). `ran` lists the tool calls
 // that got through.
 const engine = (
@@ -31,6 +46,7 @@ const engine = (
   files: Record<string, string>,
   weekly: number | null = 17,
   hasBrokenEnv = false,
+  kept: Record<string, unknown> = {},
 ) => {
   const world = {
     files: { ...files },
@@ -41,7 +57,7 @@ const engine = (
     clock: mock.clock(on, { now: 1_000_000 }),
   }
 
-  mock.store(on)
+  mock.store(on, kept)
 
   on('env.get', (_, e) => {
     if (hasBrokenEnv) {
@@ -60,15 +76,10 @@ const engine = (
     value: {
       startedAt: 0,
       context: {} as never,
-      // The five-hour window is never what the budget is held against.
-      rateLimits: [
-        { kind: 'five_hour', percentUsed: 80 },
-        ...(world.weekly === null
-          ? []
-          : [{ kind: 'seven_day', percentUsed: world.weekly, resetsAt: RESETS_AT }]),
-      ],
+      rateLimits: windows(world.weekly),
     },
   }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
   on('fs.read', (_, e) => {
     const text = world.files[e.path]
 
@@ -91,6 +102,17 @@ const engine = (
   })
 
   return world
+}
+
+// A response comes in with a new weekly figure, and the engine reports that the
+// session's reading moved, as it does after a turn.
+const respond = async ($: Engine, world: ReturnType<typeof engine>, weekly: number) => {
+  world.weekly = weekly
+  await $.session.measure({
+    context: { window: 200_000 },
+    rateLimits: windows(weekly),
+    changed: ['rateLimits'],
+  })
 }
 
 const START = { cwd: '/', surface: 'terminal', isInteractive: true } as const
@@ -222,9 +244,11 @@ test('a budget is not enforced while the account reports no weekly usage', async
 })
 
 test('a new session is held to the last reading another session took', async ($, on) => {
-  const world = engine(on, { [CAP]: '25\n' }, 60)
+  const world = engine(on, { [CAP]: '25\n' }, null)
 
+  // A response comes in at 60%, and the reading is kept.
   await $.session.start(START)
+  await respond($, world, 60)
   expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith('USAGE BUDGET REACHED')
 
   // A session that has no reading of its own yet.
@@ -239,9 +263,10 @@ test('a new session is held to the last reading another session took', async ($,
 })
 
 test('a kept reading is dropped once its window has reset', async ($, on) => {
-  const world = engine(on, { [CAP]: '25\n' }, 60)
+  const world = engine(on, { [CAP]: '25\n' }, null)
 
   await $.session.start(START)
+  await respond($, world, 60)
   expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith('USAGE BUDGET REACHED')
 
   world.weekly = null
@@ -261,8 +286,8 @@ test('a session with a reading of its own goes by it, not by a kept one', async 
   expect(world.ran).toEqual(['Bash'])
 })
 
-test('a budget set in one account leaves the other account and the machine-wide file alone', async ($, on) => {
-  const world = engine(on, { [CAP]: '75\n', [CONFIG]: HOME_CONFIG })
+test('a budget set in the desktop app leaves the terminal one alone, and the other way round', async ($, on) => {
+  const world = engine(on, { [CAP]: '75\n', [CONFIG]: DESKTOP_CONFIG })
 
   // The desktop app's session, signed in to the work account.
   world.env = { ...world.env, ...WORK_ENV }
@@ -272,20 +297,38 @@ test('a budget set in one account leaves the other account and the machine-wide 
   expect(world.files[CAP]).toBe('75\n')
   expect((await $.command.run(run('', 'composer'))).text).toBe('Usage budget: 57%. Weekly usage: 17%.')
 
-  // The terminal's session, signed in to the personal account.
+  // The terminal's session, signed in to the personal account: it goes by the
+  // machine-wide budget, though the config file names the work login.
   world.env = { HOME: '/Users/owner' }
   await $.session.start(START)
-  expect((await $.command.run(run('', 'composer'))).text).toBe(
-    'Usage budget: 75%. Weekly usage: 17%. This account has set no budget of its own, so the machine-wide one applies.',
-  )
-  expect((await $.command.run(run('90', 'composer'))).text).toBe('Usage budget set to 90% for this account.')
-  expect(world.files[HOME_CAP]).toBe('90\n')
+  expect((await $.command.run(run('', 'composer'))).text).toBe('Usage budget: 75%. Weekly usage: 17%.')
+  expect((await $.command.run(run('90', 'composer'))).text).toBe('Usage budget set to 90%.')
+  expect(world.files[CAP]).toBe('90\n')
   expect(world.files[WORK_CAP]).toBe('57\n')
-  expect(world.files[CAP]).toBe('75\n')
+})
+
+test('a terminal session is not taken for the login the config file names', async ($, on) => {
+  // The desktop app's sessions leave the work login in the config file. The
+  // terminal session is signed in to another account, at 48% of its week.
+  const world = engine(on, { [CAP]: '75\n', [WORK_CAP]: '25\n', [CONFIG]: DESKTOP_CONFIG }, 48)
+
+  // Held to the machine-wide 75, not the work account's 25.
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+  expect((await $.command.run(run('', 'composer'))).text).toBe('Usage budget: 75%. Weekly usage: 48%.')
+
+  // Its reading is not kept for the work account: a new desktop session with
+  // no reading of its own yet has none to go by.
+  await respond($, world, 49)
+  world.env = { ...world.env, ...WORK_ENV }
+  world.weekly = null
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+  expect(world.ran).toEqual(['Bash', 'Bash'])
 })
 
 test('each account is stopped at its own budget', async ($, on) => {
-  const world = engine(on, { [CAP]: '75\n', [CONFIG]: HOME_CONFIG, [WORK_CAP]: '57\n' }, 65)
+  const world = engine(on, { [CAP]: '75\n', [CONFIG]: DESKTOP_CONFIG, [WORK_CAP]: '57\n' }, 65)
 
   // Work: 65% used against its own 57.
   world.env = { ...world.env, ...WORK_ENV }
@@ -315,14 +358,16 @@ test('an account that turns its budget off is not held to the machine-wide one',
 })
 
 test('a usage reading kept for one account is not used for another', async ($, on) => {
-  const world = engine(on, { [CAP]: '25\n', [CONFIG]: HOME_CONFIG }, 60)
+  const world = engine(on, { [CAP]: '25\n', [CONFIG]: DESKTOP_CONFIG }, null)
 
   // The work account's session takes a reading of 60%, and it is kept.
   world.env = { ...world.env, ...WORK_ENV }
   await $.session.start(START)
+  await respond($, world, 60)
   expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith('USAGE BUDGET REACHED')
 
-  // A new personal session with no reading yet is not held to the work figure.
+  // A new terminal session with no reading yet is not held to the work figure,
+  // though the config file names the work login.
   world.env = { HOME: '/Users/owner' }
   world.weekly = null
   await $.session.start(START)
@@ -335,6 +380,44 @@ test('a usage reading kept for one account is not used for another', async ($, o
     'USAGE BUDGET REACHED: weekly usage is at 60% and the budget is 25%.',
   )
   expect(world.ran).toEqual(['Bash'])
+})
+
+test('an idle session leaves a newer reading another session kept alone', async ($, on) => {
+  // Another session of the account kept 60% after its last response. This
+  // session's own last response, long ago, said 13%, and it sits idle.
+  const world = engine(on, { [CAP]: '25\n' }, 13, false, {
+    [KEPT]: { percent: 60, resetsAt: Date.parse(RESETS_AT) },
+  })
+
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+  // Six refreshes of the row.
+  await world.clock.advance(30_000)
+
+  // A new session with no reading of its own yet is held to the newer 60%.
+  world.weekly = null
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toStartWith(
+    'USAGE BUDGET REACHED: weekly usage is at 60% and the budget is 25%.',
+  )
+})
+
+test('readings an earlier version kept are not read', async ($, on) => {
+  // 0.3.0 took terminal sessions for the login the config file named, so a
+  // reading it kept may be another account's.
+  const stale = { percent: 76, resetsAt: Date.parse(RESETS_AT) }
+  const world = engine(on, { [CAP]: '25\n' }, null, false, {
+    [OLD_KEPT]: stale,
+    [OLD_WORK_KEPT]: stale,
+  })
+
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+
+  world.env = { ...world.env, ...WORK_ENV }
+  await $.session.start(START)
+  expect((await $.tool.call({ tool: 'Bash', command: 'ls' })).deny).toBeUndefined()
+  expect(world.ran).toEqual(['Bash', 'Bash'])
 })
 
 test('an account id that is not one is not used as a file name', async ($, on) => {

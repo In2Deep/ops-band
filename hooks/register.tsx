@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, ToolCallInput } from 'claude-code'
+import type { EngineInterface, Register, SessionRateLimit, ToolCallInput } from 'claude-code'
 
 import type { Reading, Snapshot, Worker } from '../types'
 
@@ -11,20 +11,27 @@ import type { Reading, Snapshot, Worker } from '../types'
 // working, usage against the budget, the box that sets it, and the model. It
 // draws wherever the band is raised: the terminal, the desktop app, mobile.
 //
-// A budget belongs to the account that set it: two accounts on one machine (a
-// personal login in the terminal, a work login in the desktop app) each have
-// their own number and their own usage.
+// A budget belongs to the account that set it, where the mod can tell which
+// account a session is signed in to. The desktop app names each session's
+// account, so a work login there has its own number and its own usage; a
+// terminal session goes by the machine-wide budget.
 
 const snapshot = atom({ plugin: 'ops-band', key: 'snapshot' } as const, null)
 
 const LIVE = new Set(['pending', 'running', 'waiting'])
 const REFRESH_MS = 5000
 const JOB_STALE_MS = 45 * 60 * 1000
-const ACCOUNT_MS = 60 * 1000
 const CAP_FILE = 'usage_cap'
 const CAP_DIR = 'usage_cap.d'
-const READING = 'reading'
+// The store key the readings are kept under. 0.3.0 kept them under "reading",
+// and took a terminal session for whichever login the config file named, so a
+// reading it kept may be another account's: those are not read.
+const READING = 'last-reading'
 const ID = /^[0-9a-f-]{8,64}$/i
+
+// A usage reading as a session takes it: the percent used, and when its window
+// resets (epoch milliseconds), null when the account did not say.
+type Live = { percent: number; resetsAt: number | null }
 
 const minutes = (ms: number): string => {
   const whole = Math.max(0, Math.round(ms / 60000))
@@ -55,28 +62,17 @@ const readClaude = async ($: EngineInterface, name: string): Promise<string | nu
 
 // The account the session is signed in to, as a name fit for a file path, or
 // null when the mod cannot tell. A host that hands the session its login (the
-// desktop app) names the account in the environment; a terminal session's is
-// in the login Claude Code keeps in its own config file.
+// desktop app) names the account in the environment. Nothing names a terminal
+// session's login reliably: Claude Code's config file, ~/.claude.json, is
+// shared by every login on the machine, and the desktop app's sessions keep
+// writing theirs into it. So a terminal session is null, and goes by the
+// machine-wide budget.
 const readAccount = async ($: EngineInterface): Promise<string | null> => {
   try {
-    let organization = await $.env.get('CLAUDE_CODE_ORGANIZATION_UUID')
-    let person = await $.env.get('CLAUDE_CODE_ACCOUNT_UUID')
-
-    if (!organization && !person) {
-      const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) || (await $.env.get('HOME'))
-      const text = dir ? await readText($, `${dir}/.claude.json`) : null
-      const login =
-        text === null
-          ? undefined
-          : (JSON.parse(text) as { oauthAccount?: Record<string, unknown> }).oauthAccount
-
-      organization = String(login?.organizationUuid ?? '')
-      person = String(login?.accountUuid ?? '')
-    }
-
-    const ids = [organization, person].filter(
-      (id): id is string => typeof id === 'string' && ID.test(id),
-    )
+    const ids = [
+      await $.env.get('CLAUDE_CODE_ORGANIZATION_UUID'),
+      await $.env.get('CLAUDE_CODE_ACCOUNT_UUID'),
+    ].filter((id): id is string => typeof id === 'string' && ID.test(id))
 
     return ids.length > 0 ? ids.join('_').toLowerCase() : null
   } catch {
@@ -84,8 +80,8 @@ const readAccount = async ($: EngineInterface): Promise<string | null> => {
   }
 }
 
-// The session's account: read at the session's start and once a minute after
-// (a /login changes it), so no tool call waits on the config file.
+// The session's account, read at the session's start: the environment does not
+// change while the session runs.
 let account: string | null | undefined
 
 const who = async ($: EngineInterface): Promise<string | null> => {
@@ -172,35 +168,51 @@ const readJob = async ($: EngineInterface, now: number): Promise<string | null> 
   return `${name}: ${stage}, ${minutes(now - since)}`
 }
 
-// What this session's last response reported: the fullest window of the
-// account, the five-hour window left out (it resets on its own within the day),
-// and when that window resets. Null before the session's first reading, or off
-// a subscription.
-const readLive = async (
-  $: EngineInterface,
-): Promise<{ percent: number; resetsAt: number | null } | null> => {
+// The reading in a response's usage windows: the fullest window of the account,
+// the five-hour window left out (it resets on its own within the day), and when
+// that window resets. Null when there is no such window: before the session's
+// first reading, or off a subscription.
+const fullest = (limits: readonly SessionRateLimit[]): Live | null => {
+  const windows = limits.filter(limit => limit.kind !== 'five_hour')
+
+  if (windows.length === 0) {
+    return null
+  }
+
+  const most = windows.reduce((top, limit) => (limit.percentUsed > top.percentUsed ? limit : top))
+  const resetsAt = Date.parse(most.resetsAt ?? '')
+
+  return { percent: most.percentUsed, resetsAt: Number.isFinite(resetsAt) ? resetsAt : null }
+}
+
+// What this session's last response reported.
+const readLive = async ($: EngineInterface): Promise<Live | null> => {
   try {
-    const usage = await $.session.usage()
-    const windows = usage.rateLimits.filter(limit => limit.kind !== 'five_hour')
-
-    if (windows.length === 0) {
-      return null
-    }
-
-    const fullest = windows.reduce((most, limit) =>
-      limit.percentUsed > most.percentUsed ? limit : most,
-    )
-    const resetsAt = Date.parse(fullest.resetsAt ?? '')
-
-    return { percent: fullest.percentUsed, resetsAt: Number.isFinite(resetsAt) ? resetsAt : null }
+    return fullest((await $.session.usage()).rateLimits)
   } catch {
     return null
   }
 }
 
-// The last reading any session of this account took on this machine, kept in
-// the mod's store until its window resets. Usage only grows within a window,
-// so the real figure is at least this.
+// Keeps a reading for the account's other sessions. Called only when the engine
+// reports that this session's reading moved, which takes a new response. A
+// session that sits idle goes on reporting its last response's figure, so a
+// reading kept on every refresh put older figures over newer ones.
+const keepReading = async ($: EngineInterface, reading: Live | null): Promise<void> => {
+  if (reading === null || reading.resetsAt === null) {
+    return
+  }
+
+  try {
+    await $.store.set(await readingKey($), { percent: reading.percent, resetsAt: reading.resetsAt })
+  } catch {
+    // The store could not be written: the next reading that moves tries again.
+  }
+}
+
+// The last reading a session of this account kept on this machine, held in the
+// mod's store until its window resets. Usage only grows within a window, so
+// the real figure is at least this.
 const recall = async ($: EngineInterface, now: number): Promise<Reading | null> => {
   const kept = await $.store.get(await readingKey($))
 
@@ -222,27 +234,16 @@ const recall = async ($: EngineInterface, now: number): Promise<Reading | null> 
 const readUsed = async ($: EngineInterface): Promise<number | null> => {
   const live = await readLive($)
 
-  try {
-    const kept = await recall($, await $.clock.now())
-
-    if (live === null) {
-      return kept?.percent ?? null
-    }
-
-    if (
-      live.resetsAt !== null &&
-      (kept?.percent !== live.percent || kept.resetsAt !== live.resetsAt)
-    ) {
-      await $.store.set(await readingKey($), {
-        percent: live.percent,
-        resetsAt: live.resetsAt,
-      })
-    }
-  } catch {
-    // The store could not be read or written: the session's own reading stands.
+  if (live !== null) {
+    return live.percent
   }
 
-  return live?.percent ?? null
+  try {
+    return (await recall($, await $.clock.now()))?.percent ?? null
+  } catch {
+    // The store could not be read: there is no reading to go by.
+    return null
+  }
 }
 
 // The main loop's model as /model shows it, or null when it cannot be read.
@@ -408,11 +409,16 @@ export const register: Register = on => {
     $.clock.every(REFRESH_MS, () => {
       void refreshQuietly($)
     })
-    $.clock.every(ACCOUNT_MS, () => {
-      void readAccount($).then(id => {
-        account = id
-      })
-    })
+
+    return next(e)
+  })
+
+  // The engine reports here when a response moved the session's reading: the
+  // one moment a session keeps it for the account's other sessions.
+  on('session.measure', async ($, e, next) => {
+    if (e.changed.includes('rateLimits')) {
+      await keepReading($, fullest(e.rateLimits))
+    }
 
     return next(e)
   })

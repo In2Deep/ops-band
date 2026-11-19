@@ -53,15 +53,17 @@ The number is a whole percent of your weekly allowance, from 1 to 100. You can a
 
 In the desktop and mobile apps the box is the surest way to set it. If `/cap 55` there answers that only the person at the keyboard sets the budget, type the number into the box.
 
-The budget is kept in a file under `~/.claude`, so it outlasts the session. Every session signed in to the same account is held to the same number, in whichever app it runs.
+The budget is kept in a file under `~/.claude`, so it outlasts the session, and every session that reads the same file is held to the same number. The next section says which file a session reads.
 
 ## One budget per account
 
-A budget belongs to the account that set it. If you use two accounts on one machine, say a personal login in the terminal and a work login in the desktop app, each has its own number and is measured against its own usage. Setting `/cap 57` in one does not move the other.
+A budget belongs to the account that set it, where the mod can tell which account a session is signed in to.
 
-Each account's budget is a file in `~/.claude/usage_cap.d/`, named by the account's id. The mod takes the id from the environment where the app hands the session its login, as the desktop app does, and otherwise from the login in Claude Code's own config file, `~/.claude.json`. A session whose account it cannot find uses the machine-wide file `~/.claude/usage_cap`.
+The desktop app hands each session its login, and the mod takes the account's id from there. Each such account's budget is a file in `~/.claude/usage_cap.d/`, named by the id, and it is measured against that account's own usage.
 
-An account that has not set a budget of its own is also held to `~/.claude/usage_cap` when that file exists. Versions before 0.3 kept the one budget there, so a budget you set earlier still applies after you update. `/cap` on its own tells you when that is the number in force.
+A terminal session uses the machine-wide file `~/.claude/usage_cap`. Nothing names a terminal session's login reliably: Claude Code's config file, `~/.claude.json`, is shared by every login on the machine, and the desktop app's sessions keep writing theirs into it. So with a personal login in the terminal and a work login in the desktop app, `/cap 57` in the desktop app sets the work account's budget, and `/cap 57` in the terminal sets the machine-wide one.
+
+An account that has not set a budget of its own is also held to `~/.claude/usage_cap` when that file exists. Versions before 0.3 kept the one budget there, so a budget you set earlier still applies after you update. `/cap` on its own tells you when that is the number in force. Until a desktop app account sets a budget of its own, a `/cap` typed in the terminal moves its number too.
 
 ## What happens when the budget is reached
 
@@ -117,7 +119,8 @@ Claude cannot raise its own budget through its tools either. A file edit aimed a
 
 - It stops tool calls. It cannot cut off a reply that is already being written, or a tool call that was already running when usage crossed the line, so a run ends a little above the budget. Leave yourself a few points of margin.
 - It needs a usage reading. Claude Code reports usage windows on a subscription. On an account that reports none, the row shows `usage ?` and nothing is refused.
-- A session gets its own first reading only after its first response, and the tool calls in that response have run by then. To cover that, the mod keeps each account's last reading between sessions and holds a new session to it until the session has its own. An account's first session on a machine, and its first after the weekly reset, have no earlier reading to go by, so the tool calls of their first response run unchecked.
+- A session gets its own first reading only after its first response, and the tool calls in that response have run by then. To cover that, the mod keeps each account's last reading between sessions and holds a new session to it until the session has its own. A session keeps its reading only when a response moves it, so an idle session's older figure never replaces a newer one. An account's first session on a machine, and its first after the weekly reset, have no earlier reading to go by, so the tool calls of their first response run unchecked.
+- A `claude` started from a shell inside a desktop app session inherits that session's account id, but not its login: it signs in as the terminal does. The mod counts such a run as the desktop account's.
 - The five-hour window is not budgeted.
 - Sessions without the mod are not stopped. Their usage still counts toward the same weekly figure, so a session that does have the mod stops when the total gets there.
 - If the check itself fails with an error, the tool call is let through, and a budget file the mod cannot read counts as no budget of that account's own. A broken check should not freeze an unattended run.
@@ -128,7 +131,7 @@ Claude cannot raise its own budget through its tools either. A file edit aimed a
 
 - `workers` shows how many subagents are out right now, how long the longest has been out, and what the first two are doing.
 - `usage` is the weekly usage of the account the session is signed in to, as a percent.
-- `budget %` is the box that holds that account's budget.
+- `budget %` is the box that holds the budget the session is held to: that account's own, or the machine-wide one.
 - The last segment is the model the session is running.
 
 The row is drawn in the terminal, the desktop app and the mobile apps. It refreshes every 5 seconds. The budget check does not wait for the refresh.
@@ -162,6 +165,8 @@ Restart Claude Code afterwards.
 
 From 0.2, nothing else is needed. Version 0.3 made the budget per account, and the budget you already set keeps applying as described under "One budget per account".
 
+Version 0.3.1 fixes how 0.3.0 told accounts apart. 0.3.0 took a terminal session's account from `~/.claude.json`, which usually names the desktop app's login, so a terminal session could be held to the desktop account's budget and could leave its usage figure under that account. Version 0.3.1 holds terminal sessions to the machine-wide budget and starts the kept usage readings afresh. If you set a budget from the terminal under 0.3.0, it may have gone to the desktop account's file: run `/cap` in each app after updating to see the number in force.
+
 Version 0.1 only recorded the budget. To make it stop anything, you had to set up a separate hook script and a status line script from a prompt in the old README. From 0.2 the stop is built into the mod and reads usage from Claude Code directly, so the old hook and status line script are no longer needed. Remove them if you use more than one account on the machine: the old hook knows only the machine-wide budget, and it measures every session against whichever account's usage the status line saved last.
 
 ## Files
@@ -171,7 +176,7 @@ Version 0.1 only recorded the budget. To make it stop anything, you had to set u
 - `tests/cap.test.ts`: the tests. Run them with `claude plugin test .` from the repository folder.
 - `docs/`: the screenshots on this page.
 
-The mod reads the budget files (`~/.claude/usage_cap` and `~/.claude/usage_cap.d/`), `~/.claude/ops-band/job.status`, and the account id in `~/.claude.json`. It writes only the budget files, and keeps each account's last usage reading in its own plugin store. Nothing is sent anywhere.
+The mod reads the budget files (`~/.claude/usage_cap` and `~/.claude/usage_cap.d/`), `~/.claude/ops-band/job.status`, and the account id the desktop app puts in a session's environment. It writes only the budget files, and keeps each account's last usage reading in its own plugin store. Nothing is sent anywhere.
 
 ## License
 
